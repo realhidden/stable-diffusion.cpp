@@ -42,6 +42,10 @@ void GGMLRunner::alloc_params_ctx() {
 }
 
 void GGMLRunner::free_params_ctx() {
+    if (tensor_split_params_buffer_ != nullptr) {
+        ggml_backend_buffer_free(tensor_split_params_buffer_);
+        tensor_split_params_buffer_ = nullptr;
+    }
     if (params_ctx != nullptr) {
         ggml_free(params_ctx);
         params_ctx = nullptr;
@@ -682,6 +686,22 @@ void GGMLRunner::set_graph_cut_layer_split_backend_vram_limits(const std::vector
     graph_cut_layer_split_assignments_.clear();
     graph_cut_layer_split_node_assignments_.clear();
     graph_cut_layer_split_primary_notice_logged_ = false;
+}
+
+bool GGMLRunner::alloc_tensor_split_params() {
+    if (tensor_split_params_buffer_ != nullptr) {
+        return true;
+    }
+    tensor_split_params_buffer_ = sd_backend_tensor_split_alloc_params(runtime_backend, params_ctx);
+    if (tensor_split_params_buffer_ == nullptr) {
+        LOG_ERROR("%s: failed to place params on the tensor-split backend", get_desc().c_str());
+        return false;
+    }
+    LOG_INFO("%s: params placed on %s (%.2f MB per device at most)",
+             get_desc().c_str(),
+             ggml_backend_name(runtime_backend),
+             ggml_backend_buffer_get_size(tensor_split_params_buffer_) / (1024.f * 1024.f));
+    return true;
 }
 
 void GGMLRunner::set_runtime_backends(const std::vector<ggml_backend_t>& backends) {

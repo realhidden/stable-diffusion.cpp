@@ -550,7 +550,8 @@ ArgOptions SDContextParams::get_options() {
         {"",
          "--split-mode",
          "weight distribution for modules assigned multiple devices (--backend \"diffusion=cuda0&cuda1\"): "
-         "layer (whole transformer blocks per device, default) or row (matmul rows split across devices, CUDA only). "
+         "layer (whole transformer blocks per device, default), row (matmul rows split across devices, CUDA only) "
+         "or tensor (attention heads and MLP units split across GPUs, all running every layer). "
          "Accepts a single mode or per-module assignments, e.g. row or diffusion=row,te=layer",
          (int)',',
          &split_mode},

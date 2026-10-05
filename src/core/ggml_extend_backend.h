@@ -43,6 +43,7 @@ using SDBackendHandle = std::unique_ptr<struct ggml_backend, SDBackendHandleDele
 enum class SDSplitMode {
     LAYER,
     ROW,
+    TENSOR,
 };
 
 class SDBackendManager {
@@ -51,6 +52,8 @@ private:
     SDBackendAssignment params_assignment_;
     SDBackendAssignment split_mode_assignment_;
     std::unordered_map<std::string, SDBackendHandle> backends_;
+    // One meta backend per device list, for --split-mode tensor.
+    std::unordered_map<std::string, SDBackendHandle> meta_backends_;
 
 public:
     SDBackendManager() = default;
@@ -71,6 +74,9 @@ public:
     std::vector<ggml_backend_t> runtime_backends(SDBackendModule module);
 
     SDSplitMode split_mode(SDBackendModule module) const;
+    // The meta backend for a module with split mode `tensor` and more than one
+    // device, created on first use; nullptr otherwise.
+    ggml_backend_t tensor_split_backend(SDBackendModule module);
     ggml_backend_buffer_type_t split_buffer_type(ggml_backend_t backend,
                                                  const std::vector<float>& tensor_split);
 
@@ -87,6 +93,10 @@ private:
 
 bool sd_backend_is(ggml_backend_t backend, const std::string& name);
 bool sd_backend_is_cpu(ggml_backend_t backend);
+bool sd_backend_is_tensor_split(ggml_backend_t backend);
+// Allocates every tensor of `ctx` (a runner's params context) on a tensor-split
+// backend. Each device gets a buffer sized for its own slices.
+ggml_backend_buffer_t sd_backend_tensor_split_alloc_params(ggml_backend_t backend, ggml_context* ctx);
 bool sd_backend_supports_cuda_mma(ggml_backend_t backend);
 ggml_backend_buffer_t sd_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t device,
                                                           void* ptr,

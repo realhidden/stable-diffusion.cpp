@@ -485,7 +485,10 @@ namespace Qwen {
                 prefix_cache_auto_f32 = false;
             }
             QwenImage21PrefixCache cache;
-            if (prefix_cache_enabled && !prefix_cache_disabled && extra != nullptr && extra->prefix_id != 0 && layout.prefix_length > 0) {
+            // The cache packs K/V across heads, which a tensor split keeps on
+            // different devices; the prefix is a few dozen tokens anyway.
+            if (prefix_cache_enabled && !prefix_cache_disabled && !sd_backend_is_tensor_split(runtime_backend) &&
+                extra != nullptr && extra->prefix_id != 0 && layout.prefix_length > 0) {
                 cache.name = "qwen_image_2_1.prefix." + std::to_string(extra->prefix_id) +
                              ".circular." + std::to_string(circular_x_enabled) + std::to_string(circular_y_enabled);
                 cache.prefix_length = layout.prefix_length;

@@ -378,6 +378,26 @@ bool StableDiffusionGGML::register_runner_params(ModelComponent component,
     ModelManager::ResidencyMode residency_mode =
         backend_manager.params_backend_is_disk(module) ? ModelManager::ResidencyMode::Disk : ModelManager::ResidencyMode::ParamBackend;
 
+    if (sd_backend_is_tensor_split(backend_for(module))) {
+        // Weights must be placed before the model manager sees them, and stay
+        // resident: the meta backend cannot map a weight allocated later.
+        if constexpr (std::is_base_of_v<GGMLRunner, T>) {
+            if (!model->alloc_tensor_split_params()) {
+                return false;
+            }
+            return model_manager->register_param_tensors(component,
+                                                         std::move(group_tensors),
+                                                         ModelManager::ResidencyMode::ParamBackend,
+                                                         backend_for(module),
+                                                         backend_for(module),
+                                                         params_mem_size,
+                                                         false,
+                                                         false,
+                                                         &tensor_ops);
+        }
+        LOG_ERROR("%s module cannot run tensor-split", sd_backend_module_name(module));
+        return false;
+    }
     std::vector<ggml_backend_t> module_backends = backend_manager.runtime_backends(module);
     if (module_backends.size() > 1) {
         if constexpr (has_set_runtime_backends<T>::value) {

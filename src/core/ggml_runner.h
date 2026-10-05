@@ -156,6 +156,10 @@ protected:
     ggml_backend_t runtime_backend = nullptr;
 
     ggml_context* params_ctx = nullptr;
+    // Owned when the runtime backend is a tensor split: the whole params_ctx is
+    // placed up front, because the meta backend can only map weights it saw at
+    // allocation time.
+    ggml_backend_buffer_t tensor_split_params_buffer_ = nullptr;
 
     sd::RunnerCache cache_;
     sd::GraphCutTensorCache cut_cache_;
@@ -390,6 +394,7 @@ public:
     void set_graph_cut_layer_split_backend_vram_limits(const std::vector<size_t>& limits);
 
     void set_runtime_backends(const std::vector<ggml_backend_t>& backends);
+    bool alloc_tensor_split_params();
 };
 
 #endif  // __SD_CORE_GGML_RUNNER_H__

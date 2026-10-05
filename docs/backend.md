@@ -122,6 +122,31 @@ GGML does not expose exact shard allocation sizes, the managed budget currently
 counts a split buffer's full size on each participating device. This is a
 conservative bound and can reject otherwise feasible layouts.
 
+### Tensor split (`--split-mode tensor`)
+
+`tensor` runs every layer on all listed GPUs at once through GGML's meta
+device:
+
+```shell
+sd-cli --diffusion-model qwen-image-2.1-Q8_0.gguf ... --backend "diffusion=cuda0&cuda1,te=cpu,vae=cuda0" --split-mode diffusion=tensor
+```
+
+Inside each transformer block the Q/K/V and first MLP projections are split by
+output, so each device owns whole attention heads and a slice of the MLP hidden
+units, and the attention output and MLP down projections are split by input;
+their partial sums are all-reduced across the devices (NCCL when built with it).
+Everything else is mirrored. Weights are resident on the listed devices for the
+lifetime of the model, each device holding its own slices plus the mirrored
+tensors.
+
+Currently only Qwen-Image 2.1 has split rules; other models load mirrored on
+every device, which is correct but not faster. The Qwen-Image 2.1 text prefix
+cache is disabled under a tensor split.
+
+Every block exchanges two full activations, so the interconnect decides the
+gain: on two RTX 3060s with one in a PCIe 3.0 x4 slot, a 1024x1024 Qwen-Image
+2.1 step takes 6.6 s split against 6.1 s on one card.
+
 Direct ("immediately") LoRA application cannot patch row-split tensors; with
 `--split-mode row` the automatic LoRA mode selects runtime application, and an
 explicit `--lora-apply-mode immediately` skips the split tensors with a

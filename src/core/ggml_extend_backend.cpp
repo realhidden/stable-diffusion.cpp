@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -12,6 +13,7 @@
 #include <cuda.h>
 #endif
 
+#include "core/tensor_split.h"
 #include "core/util.h"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
@@ -28,6 +30,11 @@ static std::string trim_copy(const std::string& value) {
     }
     return value.substr(begin, end - begin);
 }
+
+// ggml caches meta devices for the life of the process, keyed by the split
+// callback's userdata, so each registry lives as long and is never freed.
+static std::mutex tensor_split_mutex;
+static std::map<ggml_backend_dev_t, std::unique_ptr<SDTensorSplitRegistry>> tensor_split_registries;
 
 static std::string lower_copy(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -426,6 +433,33 @@ static ggml_backend_t init_named_backend(const std::string& name) {
     return ggml_backend_init_by_name(resolved.c_str(), nullptr);
 }
 
+bool sd_backend_is_tensor_split(ggml_backend_t backend) {
+    return backend != nullptr && ggml_backend_is_meta(backend);
+}
+
+ggml_backend_buffer_t sd_backend_tensor_split_alloc_params(ggml_backend_t backend, ggml_context* ctx) {
+    if (!sd_backend_is_tensor_split(backend) || ctx == nullptr) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(tensor_split_mutex);
+    auto it = tensor_split_registries.find(ggml_backend_get_device(backend));
+    if (it == tensor_split_registries.end()) {
+        return nullptr;
+    }
+    // The split of a projection depends on its siblings (head size, the shape
+    // of the projection it feeds), so the callback needs every param by name
+    // before the first one is placed.
+    for (ggml_tensor* t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        it->second->tensors[ggml_get_name(t)] = t;
+    }
+    ggml_backend_buffer_t buffer =
+        ggml_backend_meta_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(backend));
+    if (buffer != nullptr) {
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
+    return buffer;
+}
+
 bool sd_backend_is_cpu(ggml_backend_t backend) {
     if (backend == nullptr) {
         return false;
@@ -765,6 +799,8 @@ SDBackendManager::~SDBackendManager() {
 }
 
 void SDBackendManager::reset() {
+    // Meta backends hold their own simple backends; free them before the rest.
+    meta_backends_.clear();
     backends_.clear();
     runtime_assignment_    = {};
     params_assignment_     = {};
@@ -788,10 +824,16 @@ static std::string primary_device_name(const std::string& value) {
 }
 
 ggml_backend_t SDBackendManager::runtime_backend(SDBackendModule module) {
+    if (ggml_backend_t meta = tensor_split_backend(module)) {
+        return meta;
+    }
     return init_cached_backend(primary_device_name(runtime_assignment_.get(module)));
 }
 
 std::vector<ggml_backend_t> SDBackendManager::runtime_backends(SDBackendModule module) {
+    if (ggml_backend_t meta = tensor_split_backend(module)) {
+        return {meta};
+    }
     std::vector<ggml_backend_t> backends;
     for (const std::string& name : split_device_list(runtime_assignment_.get(module))) {
         ggml_backend_t backend = init_cached_backend(name);
@@ -878,8 +920,70 @@ bool SDBackendManager::init(const char* backend_spec,
 }
 
 SDSplitMode SDBackendManager::split_mode(SDBackendModule module) const {
-    return lower_copy(trim_copy(split_mode_assignment_.get(module))) == "row" ? SDSplitMode::ROW
-                                                                              : SDSplitMode::LAYER;
+    const std::string mode = lower_copy(trim_copy(split_mode_assignment_.get(module)));
+    if (mode == "row") {
+        return SDSplitMode::ROW;
+    }
+    return mode == "tensor" ? SDSplitMode::TENSOR : SDSplitMode::LAYER;
+}
+
+static ggml_backend_dev_t tensor_split_device(const std::vector<ggml_backend_dev_t>& devs) {
+    std::lock_guard<std::mutex> lock(tensor_split_mutex);
+    for (auto& entry : tensor_split_registries) {
+        if (entry.second->devices == devs) {
+            return entry.first;
+        }
+    }
+    auto registry          = std::make_unique<SDTensorSplitRegistry>();
+    registry->n_devices    = devs.size();
+    registry->devices      = devs;
+    ggml_backend_dev_t dev = ggml_backend_meta_device(const_cast<ggml_backend_dev_t*>(devs.data()), devs.size(),
+                                                      sd_tensor_split_state, registry.get());
+    if (dev != nullptr) {
+        tensor_split_registries.emplace(dev, std::move(registry));
+    }
+    return dev;
+}
+
+ggml_backend_t SDBackendManager::tensor_split_backend(SDBackendModule module) {
+    if (split_mode(module) != SDSplitMode::TENSOR) {
+        return nullptr;
+    }
+    const std::vector<std::string> names = split_device_list(runtime_assignment_.get(module));
+    if (names.size() < 2) {
+        return nullptr;
+    }
+    std::vector<ggml_backend_dev_t> devs;
+    std::string key;
+    for (const std::string& name : names) {
+        ggml_backend_t backend = init_cached_backend(name);
+        ggml_backend_dev_t dev = backend != nullptr ? ggml_backend_get_device(backend) : nullptr;
+        if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            LOG_WARN("tensor split needs GPU devices, '%s' is not one; not splitting %s",
+                     name.c_str(), sd_backend_module_name(module));
+            return nullptr;
+        }
+        if (std::find(devs.begin(), devs.end(), dev) == devs.end()) {
+            devs.push_back(dev);
+            key += std::string(key.empty() ? "" : "&") + ggml_backend_dev_name(dev);
+        }
+    }
+    if (devs.size() < 2) {
+        return nullptr;
+    }
+    auto it = meta_backends_.find(key);
+    if (it != meta_backends_.end()) {
+        return it->second.get();
+    }
+    ggml_backend_dev_t meta_dev = tensor_split_device(devs);
+    ggml_backend_t meta         = meta_dev != nullptr ? ggml_backend_dev_init(meta_dev, nullptr) : nullptr;
+    if (meta == nullptr) {
+        LOG_ERROR("failed to create a tensor-split backend over %s", key.c_str());
+        return nullptr;
+    }
+    LOG_INFO("%s: tensor split across %s", sd_backend_module_name(module), key.c_str());
+    meta_backends_.emplace(key, SDBackendHandle(meta));
+    return meta;
 }
 
 ggml_backend_buffer_type_t SDBackendManager::split_buffer_type(ggml_backend_t backend,
@@ -972,11 +1076,11 @@ bool SDBackendManager::validate(std::string* error) const {
     };
     auto validate_split_mode_name = [&](const std::string& name) -> bool {
         const std::string lower = lower_copy(trim_copy(name));
-        if (lower.empty() || lower == "layer" || lower == "row") {
+        if (lower.empty() || lower == "layer" || lower == "row" || lower == "tensor") {
             return true;
         }
         if (error != nullptr) {
-            *error = "invalid split mode '" + name + "' (expected layer or row)";
+            *error = "invalid split mode '" + name + "' (expected layer, row or tensor)";
         }
         return false;
     };
